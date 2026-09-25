@@ -13,6 +13,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .api import StealthminerAPIError
+from .climate import PRESET_BACKUP_ONLY
 from .const import CONF_TEMPERATURE_ENTITY, DOMAIN
 from .coordinator import StealthminerDataUpdateCoordinator
 
@@ -168,10 +169,11 @@ class StealthminerAutoTuneSwitch(CoordinatorEntity[StealthminerDataUpdateCoordin
 
     @property
     def available(self) -> bool:
-        """Available while the thermostat is heating."""
+        """Available while the thermostat is heating with the miner."""
         thermostat = self.coordinator.thermostat
         return (
             self.coordinator.last_update_success
             and thermostat is not None
             and thermostat.hvac_mode == HVACMode.HEAT
+            and thermostat.preset_mode != PRESET_BACKUP_ONLY
         )

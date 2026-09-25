@@ -23,7 +23,7 @@
     "step": {
       "init": {
         "title": "Stealthminer Options",
-        "description": "Pick a temperature sensor to enable the thermostat. The controller asks for watts of heat and uses the nearest preset between the min and max presets. Gains: Kp in W per degree, Ki in W per degree-minute, Kd in W per degree/minute. The Thermostat Auto-tune switch can set them for you.",
+        "description": "Pick a temperature sensor to enable the thermostat. The controller asks for watts of heat and uses the nearest preset between the min and max presets. Gains: Kp in W per degree, Ki in W per degree-minute, Kd in W per degree/minute. The Thermostat Auto-tune switch can set them for you. The backup heater takes over when the miner can't mine (unreachable or no pool connection); the miner and the backup never heat at the same time.",
         "data": {
           "scan_interval": "Update interval (seconds)",
           "temperature_entity": "Temperature sensor",
@@ -33,7 +33,8 @@
           "ki": "Ki (integral gain)",
           "kd": "Kd (derivative gain)",
           "sleep_delay": "Sleep/wake delay",
-          "sleep_fan_speed": "Fan speed while asleep"
+          "sleep_fan_speed": "Fan speed while asleep",
+          "backup_climate": "Backup heater"
         }
       }
     }

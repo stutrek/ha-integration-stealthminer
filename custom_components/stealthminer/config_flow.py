@@ -27,6 +27,7 @@ from .const import (
     CONF_KD,
     CONF_SLEEP_DELAY,
     CONF_SLEEP_FAN_SPEED,
+    CONF_BACKUP_CLIMATE,
     DEFAULT_MAX_PROFILE,
     DEFAULT_KP,
     DEFAULT_KI,
@@ -194,6 +195,10 @@ class StealthminerOptionsFlowHandler(config_entries.OptionsFlow):
                         mode=selector.NumberSelectorMode.SLIDER,
                     )
                 ),
+                vol.Optional(
+                    CONF_BACKUP_CLIMATE,
+                    description={"suggested_value": options.get(CONF_BACKUP_CLIMATE)},
+                ): selector.EntitySelector(selector.EntitySelectorConfig(domain="climate")),
             }
         )
 

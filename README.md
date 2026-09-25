@@ -106,6 +106,23 @@ To use the miner as a heater, open the integration's options (**Settings** > **D
 - When the room needs less heat than the min preset gives, for longer than the **sleep/wake delay**, the miner goes to sleep without spinning the fans up: it switches to the min preset, sets the fans to a low manual speed, then sleeps. Waking runs the reverse (wake, fans back to automatic), and the thermostat holds the min preset for 2 minutes before moving up.
 - **Off** puts the miner to sleep the same way.
 
+### Backup heater
+Pick a climate entity as the **backup heater** to keep the room warm when the miner can't mine (the miner is unreachable, or it's awake but not connected to its pool, e.g. during an internet outage). The switch happens on the first status update that shows the problem.
+
+The miner and the backup never heat at the same time, since they may share a circuit: the miner is put to sleep before the backup is set to Heat at the thermostat's setpoint. While the backup heats, Home Assistant checks every 30 seconds whether it can open a connection to the miner's pool (nothing is sent), so the miner isn't woken while the internet is still down. Once the pool is reachable, the thermostat turns the backup off, wakes the miner and gives it 3 minutes to connect. If it can't, the miner sleeps again, the backup comes back on, and the next try is 10 minutes later. If the pool address isn't known, the thermostat wakes the miner to check every 10 minutes instead. If an unreachable miner comes back awake, the backup is turned off on that status update.
+
+A miner the thermostat put to sleep on purpose doesn't report a pool connection; that never triggers the backup.
+
+With a backup heater configured, the thermostat has three presets for choosing the heat source:
+
+| Preset | Heat source |
+|--------|-------------|
+| **Auto** | The miner, with the backup taking over during outages (as above) |
+| **Miner Only** | The miner; the backup is never used |
+| **Backup Only** | The backup; the miner is put to sleep first |
+
+Switching presets always turns one heat source off before turning the other on. Leave the backup heater itself alone while the thermostat is heating; changing it directly could run both at once.
+
 ### Tuning
 Gains are in watts: **Kp** is watts per degree off target, **Ki** is watts added per degree-minute, and **Kd** is usually left at 0.
 

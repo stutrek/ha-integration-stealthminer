@@ -17,6 +17,7 @@ CONF_KI: Final = "ki"
 CONF_KD: Final = "kd"
 CONF_SLEEP_DELAY: Final = "sleep_delay"
 CONF_SLEEP_FAN_SPEED: Final = "sleep_fan_speed"
+CONF_BACKUP_CLIMATE: Final = "backup_climate"
 
 # Defaults
 DEFAULT_PORT: Final = 8080

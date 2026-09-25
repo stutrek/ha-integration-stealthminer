@@ -17,6 +17,7 @@ from homeassistant.components.climate import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfTemperature
 from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
     async_call_later,
@@ -28,6 +29,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .api import StealthminerAPIError
 from .const import (
+    CONF_BACKUP_CLIMATE,
     CONF_KD,
     CONF_KI,
     CONF_KP,
@@ -47,6 +49,7 @@ from .const import (
 )
 from .coordinator import StealthminerDataUpdateCoordinator
 from .pid import PID, RelayTuner
+from .pool_check import pool_address, pool_reachable
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -61,12 +64,36 @@ FAN_AUTO_FALLBACK_SECONDS = 300
 # How often to check while waiting for the ramp (instead of the 60 s tick)
 WAIT_POLL_SECONDS = 15
 AUTOTUNE_TIMEOUT_SECONDS = 12 * 3600
+# While the backup heater runs, how often HA checks whether the pool is reachable
+POOL_CHECK_INTERVAL_SECONDS = 30
+# After a failed switch back (pool reachable but the miner couldn't connect),
+# or when the pool address isn't known, how long until the miner is woken to try again
+BACKUP_PROBE_INTERVAL_SECONDS = 10 * 60
+# How long a woken miner gets to connect to its pool during a check
+BACKUP_PROBE_TIMEOUT_SECONDS = 3 * 60
+# After an ordinary wake, the pool connects before hashing starts (~25 s);
+# don't count a missing pool as an outage until this long after waking
+WAKE_POOL_GRACE_SECONDS = 60
 AUTOTUNE_SENSOR_TIMEOUT_SECONDS = 10 * 60
 
 STATE_RUNNING = "running"
 STATE_SLEEPING = "sleeping"
 STATE_GOING_TO_SLEEP = "going_to_sleep"
 STATE_WAKING = "waking"
+STATE_SWITCHING_TO_BACKUP = "switching_to_backup"
+STATE_BACKUP = "backup_heating"
+STATE_CHECKING_POOL = "checking_pool"
+
+# Backup heater phases
+BACKUP_SWITCHING = "switching"  # putting the miner to sleep, then backup on
+BACKUP_ACTIVE = "active"  # backup heating, miner asleep or unreachable
+BACKUP_MANUAL = "manual"  # backup heating because Backup Only was chosen
+
+# Presets (HA's HVAC modes are a fixed list, so the heat sources are presets)
+PRESET_AUTO = "Auto"  # miner, with the backup taking over during outages
+PRESET_MINER_ONLY = "Miner Only"
+PRESET_BACKUP_ONLY = "Backup Only"
+BACKUP_PROBING = "probing"  # backup off, miner woken, waiting for the pool
 
 
 async def async_setup_entry(
@@ -115,6 +142,10 @@ class StealthminerThermostat(
         self._attr_device_info = coordinator.device_info
 
         features = ClimateEntityFeature.TARGET_TEMPERATURE
+        self._attr_preset_modes = None
+        if options.get(CONF_BACKUP_CLIMATE):
+            features |= ClimateEntityFeature.PRESET_MODE
+            self._attr_preset_modes = [PRESET_AUTO, PRESET_MINER_ONLY, PRESET_BACKUP_ONLY]
         for name in ("TURN_ON", "TURN_OFF"):
             features |= getattr(ClimateEntityFeature, name, 0)
         self._attr_supported_features = features
@@ -131,6 +162,7 @@ class StealthminerThermostat(
         self._max_profile: str = options.get(CONF_MAX_PROFILE, DEFAULT_MAX_PROFILE)
         self._sleep_delay = options.get(CONF_SLEEP_DELAY, DEFAULT_SLEEP_DELAY) * 60
         self._sleep_fan_speed = int(options.get(CONF_SLEEP_FAN_SPEED, DEFAULT_SLEEP_FAN_SPEED))
+        self._backup_entity: str | None = options.get(CONF_BACKUP_CLIMATE) or None
 
         self._hvac_mode = HVACMode.OFF
         self._target_temperature: float | None = None
@@ -160,6 +192,15 @@ class StealthminerThermostat(
         self._tune_sensor_lost_since: float | None = None
         self._tune_status: str | None = None
 
+        self._backup_phase: str | None = None
+        self._preset = PRESET_AUTO
+        # Phase to enter once a switch to the backup has finished
+        self._switch_target = BACKUP_ACTIVE
+        self._next_probe = 0.0
+        self._probe_started = 0.0
+        # Pool addresses from the miner's config, kept for checks while it sleeps
+        self._pool_addresses: list[tuple[str, int]] = []
+
     # ---- Home Assistant lifecycle ----
 
     async def async_added_to_hass(self) -> None:
@@ -173,10 +214,23 @@ class StealthminerThermostat(
                 self._target_temperature = float(temp)
             if (integral := last.attributes.get("pid_integral")) is not None:
                 self._pid.integral = float(integral)
+            if last.attributes.get("preset_mode") in (self.preset_modes or []):
+                self._preset = last.attributes["preset_mode"]
+            if self._backup_entity and last.attributes.get("backup_phase"):
+                if self._preset == PRESET_BACKUP_ONLY:
+                    self._backup_phase = BACKUP_MANUAL
+                else:
+                    # The backup may still be heating; carry on and check the miner soon
+                    self._backup_phase = BACKUP_ACTIVE
+                    self._next_probe = time.time()
         if self._target_temperature is None:
             self._target_temperature = self._default_target
 
-        self._state = STATE_SLEEPING if self.coordinator.is_sleeping else STATE_RUNNING
+        self._update_pool_addresses()
+        if self._backup_phase in (BACKUP_ACTIVE, BACKUP_MANUAL):
+            self._state = STATE_BACKUP
+        else:
+            self._state = STATE_SLEEPING if self.coordinator.is_sleeping else STATE_RUNNING
 
         self.async_on_remove(
             async_track_time_interval(self.hass, self._async_tick, CONTROL_INTERVAL)
@@ -200,6 +254,26 @@ class StealthminerThermostat(
     def _async_sensor_changed(self, event: Event) -> None:
         self.async_write_ha_state()
 
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """React to each miner status update rather than waiting for the 60 s tick.
+
+        Switches to the backup as soon as an update shows the pool or miner
+        gone, and turns the backup off as soon as a miner we lost comes back
+        awake (it may already be mining).
+        """
+        data = self.coordinator.data or {}
+        self._update_pool_addresses()
+        if self._backup_entity and self._hvac_mode == HVACMode.HEAT and self._preset == PRESET_AUTO:
+            miner_ok = data.get("online") and data.get("pool_connected")
+            if (self._backup_phase is None and not miner_ok) or (
+                self._backup_phase == BACKUP_ACTIVE
+                and data.get("online")
+                and not self.coordinator.is_sleeping
+            ):
+                self.hass.async_create_task(self._async_tick())
+        super()._handle_coordinator_update()
+
     # ---- Climate properties ----
 
     @property
@@ -215,7 +289,10 @@ class StealthminerThermostat(
     def hvac_action(self) -> HVACAction:
         if self._hvac_mode == HVACMode.OFF:
             return HVACAction.OFF
-        if self._state == STATE_SLEEPING or self.coordinator.is_sleeping:
+        if (
+            self._state in (STATE_SLEEPING, STATE_BACKUP, STATE_SWITCHING_TO_BACKUP)
+            or self.coordinator.is_sleeping
+        ):
             return HVACAction.IDLE
         return HVACAction.HEATING
 
@@ -226,6 +303,10 @@ class StealthminerThermostat(
     @property
     def target_temperature(self) -> float | None:
         return self._target_temperature
+
+    @property
+    def preset_mode(self) -> str | None:
+        return self._preset if self._backup_entity else None
 
     @property
     def autotune_active(self) -> bool:
@@ -254,6 +335,11 @@ class StealthminerThermostat(
             attrs["autotune_troughs"] = [round(t, 2) for t in self._tuner.troughs]
         if self._tune_status:
             attrs["autotune_status"] = self._tune_status
+        if self._backup_entity:
+            attrs["backup_heater"] = self._backup_entity
+            attrs["backup_phase"] = self._backup_phase
+            if self._backup_phase == BACKUP_ACTIVE:
+                attrs["next_miner_check_in_s"] = max(0, int(self._next_probe - time.time()))
         return attrs
 
     # ---- Commands ----
@@ -262,6 +348,11 @@ class StealthminerThermostat(
         if (temp := kwargs.get(ATTR_TEMPERATURE)) is not None:
             self._target_temperature = float(temp)
             self.async_write_ha_state()
+            if self._backup_phase in (BACKUP_ACTIVE, BACKUP_MANUAL):
+                try:
+                    await self._backup_on()
+                except HomeAssistantError as err:
+                    _LOGGER.error("Thermostat: couldn't update backup heater: %s", err)
             await self._async_tick()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
@@ -271,12 +362,44 @@ class StealthminerThermostat(
         self._want_sleep_since = self._want_wake_since = None
         if hvac_mode == HVACMode.OFF:
             self._cancel_autotune("cancelled: thermostat turned off")
-            if not self.coordinator.is_sleeping:
-                self._start_sleep_sequence()
+            steps = []
+            if not self.coordinator.is_sleeping and self._miner_online():
+                steps = self._sleep_steps()
+            if self._backup_phase is not None:
+                steps.append(("backup heater off", self._backup_off, None))
+                self._backup_phase = None
+            if steps:
+                self._sequence = steps
+                self._sequence_done_state = STATE_SLEEPING
+                self._state = STATE_GOING_TO_SLEEP
         else:
             # Heat: the controller decides whether to wake the miner
             self._pid.reset_time()
+            if self._preset == PRESET_BACKUP_ONLY:
+                await self._switch_to_backup(time.time(), BACKUP_MANUAL)
         self.async_write_ha_state()
+        await self._async_tick()
+
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        """Choose the heat source. Switches always go miner off -> backup on, or reverse."""
+        if preset_mode == self._preset:
+            return
+        self._preset = preset_mode
+        if self._hvac_mode == HVACMode.HEAT:
+            now = time.time()
+            if preset_mode == PRESET_BACKUP_ONLY:
+                await self._switch_to_backup(now, BACKUP_MANUAL)
+            elif self._backup_phase is not None and (
+                preset_mode == PRESET_MINER_ONLY or self._backup_phase == BACKUP_MANUAL
+            ):
+                # Backup off; the controller wakes the miner when heat is needed
+                _LOGGER.info("Thermostat: %s: turning the backup heater off", preset_mode)
+                self._sequence = [("backup heater off", self._backup_off, None)]
+                self._sequence_done_state = STATE_SLEEPING
+                self._state = STATE_SLEEPING
+                self._backup_phase = None
+                self._pid.reset_time()
+        self._notify()
         await self._async_tick()
 
     async def async_turn_on(self) -> None:
@@ -287,8 +410,8 @@ class StealthminerThermostat(
 
     async def async_start_autotune(self) -> None:
         """Start relay auto-tuning between the min and max presets."""
-        if self._hvac_mode != HVACMode.HEAT:
-            self._tune_status = "failed: thermostat must be in heat mode"
+        if self._hvac_mode != HVACMode.HEAT or self._preset == PRESET_BACKUP_ONLY:
+            self._tune_status = "failed: thermostat must be heating with the miner"
             self._notify()
             return
         presets = self._allowed_presets()
@@ -351,6 +474,10 @@ class StealthminerThermostat(
 
     async def _control(self) -> None:
         now = time.time()
+
+        if self._hvac_mode == HVACMode.HEAT and self._backup_entity:
+            if await self._backup_control(now):
+                return
 
         if self._sequence:
             await self._run_sequence()
@@ -466,6 +593,15 @@ class StealthminerThermostat(
     # ---- Sleep / wake sequences ----
 
     def _start_sleep_sequence(self) -> None:
+        self._sequence = self._sleep_steps()
+        self._sequence_done_state = STATE_SLEEPING
+        self._state = STATE_GOING_TO_SLEEP
+        self._want_sleep_since = None
+
+    def _sleep_steps(
+        self,
+    ) -> list[tuple[str, Callable[[], Awaitable[Any]], Callable[[], bool] | None]]:
+        """Lowest preset, fans to a low manual speed, then sleep."""
         presets = self._allowed_presets()
         api = self.coordinator.api
         steps: list[
@@ -482,10 +618,7 @@ class StealthminerThermostat(
             ),
             ("sleep", api.curtail_sleep, None),
         ]
-        self._sequence = steps
-        self._sequence_done_state = STATE_SLEEPING
-        self._state = STATE_GOING_TO_SLEEP
-        self._want_sleep_since = None
+        return steps
 
     def _start_wake_sequence(self) -> None:
         api = self.coordinator.api
@@ -513,7 +646,7 @@ class StealthminerThermostat(
                     return
             try:
                 await step()
-            except StealthminerAPIError as err:
+            except (StealthminerAPIError, HomeAssistantError) as err:
                 _LOGGER.error("Thermostat: %s failed, will retry: %s", name, err)
                 return
             _LOGGER.info("Thermostat: %s", name)
@@ -539,7 +672,7 @@ class StealthminerThermostat(
         ramping = any(d.get("IsRamping") for d in devs)
         return hashing and not ramping
 
-    def _schedule_wait_poll(self) -> None:
+    def _schedule_wait_poll(self, delay: float = WAIT_POLL_SECONDS) -> None:
         """Check again soon, rather than waiting for the 60 s tick."""
         if self._cancel_wait_poll is not None:
             return
@@ -549,4 +682,171 @@ class StealthminerThermostat(
             self._cancel_wait_poll = None
             self.hass.async_create_task(self._async_tick())
 
-        self._cancel_wait_poll = async_call_later(self.hass, WAIT_POLL_SECONDS, _poll)
+        self._cancel_wait_poll = async_call_later(self.hass, delay, _poll)
+
+    # ---- Backup heater ----
+
+    def _update_pool_addresses(self) -> None:
+        pools = (self.coordinator.data or {}).get("pools") or []
+        addresses = [addr for p in pools if (addr := pool_address(p.get("URL") or ""))]
+        if addresses:
+            self._pool_addresses = addresses
+
+    def _miner_online(self) -> bool:
+        return bool((self.coordinator.data or {}).get("online"))
+
+    async def _backup_control(self, now: float) -> bool:
+        """Switch to and from the backup heater. Returns True if it handled this tick.
+
+        The miner and the backup may share a circuit, so they never heat at
+        the same time: the miner sleeps before the backup turns on, and the
+        backup turns off before the miner wakes.
+        """
+        online = self._miner_online()
+
+        if self._preset == PRESET_MINER_ONLY:
+            return False
+        if self._preset == PRESET_BACKUP_ONLY and self._backup_phase not in (
+            BACKUP_SWITCHING,
+            BACKUP_MANUAL,
+        ):
+            await self._switch_to_backup(now, BACKUP_MANUAL)
+            return True
+        if self._backup_phase == BACKUP_MANUAL:
+            return True
+
+        if self._backup_phase == BACKUP_SWITCHING:
+            if self._sequence and not online and self._sequence[0][0] != "backup heater on":
+                # Lost the miner mid-way; it can't be put to sleep, so skip to the backup
+                self._sequence = [s for s in self._sequence if s[0] == "backup heater on"]
+            await self._run_sequence()
+            if not self._sequence:
+                self._backup_phase = self._switch_target
+                if self._backup_phase == BACKUP_ACTIVE:
+                    self._schedule_wait_poll(max(1.0, self._next_probe - now))
+            return True
+
+        if self._backup_phase == BACKUP_ACTIVE:
+            if online and not self.coordinator.is_sleeping:
+                # A miner we couldn't reach is back and may be mining: backup off first
+                _LOGGER.info("Thermostat: miner is back; turning the backup heater off")
+                self._start_probe(now, wake=False)
+                await self._run_sequence()
+            elif online and now >= self._next_probe:
+                if not self._pool_addresses:
+                    _LOGGER.info("Thermostat: pool address unknown; waking the miner to check")
+                    self._start_probe(now, wake=True)
+                    await self._run_sequence()
+                elif await pool_reachable(self._pool_addresses):
+                    _LOGGER.info("Thermostat: pool is reachable again; switching back to the miner")
+                    self._start_probe(now, wake=True)
+                    await self._run_sequence()
+                else:
+                    self._next_probe = now + POOL_CHECK_INTERVAL_SECONDS
+            if self._backup_phase == BACKUP_ACTIVE:
+                self._schedule_wait_poll(max(1.0, self._next_probe - now))
+            return True
+
+        if self._backup_phase == BACKUP_PROBING:
+            if self._sequence:
+                await self._run_sequence()
+                if self._sequence:
+                    return True
+            await self.coordinator.async_refresh()
+            if self._miner_online() and (self.coordinator.data or {}).get("pool_connected"):
+                _LOGGER.info("Thermostat: miner is mining again; back to normal control")
+                self._backup_phase = None
+                self._pid.reset_time()
+                # Fans stay manual until the ramp is over, as after any wake
+                self._sequence = [
+                    ("fans to auto", lambda: self.coordinator.api.set_fan_speed(FAN_SPEED_AUTO), self._ramp_done),
+                ]
+                self._sequence_done_state = STATE_RUNNING
+                self._state = STATE_WAKING
+                await self._run_sequence()
+            elif now - self._probe_started > BACKUP_PROBE_TIMEOUT_SECONDS:
+                _LOGGER.info("Thermostat: miner still can't reach its pool")
+                # Don't bounce straight back if HA can reach the pool but the miner can't
+                await self._start_backup(now, retry_in=BACKUP_PROBE_INTERVAL_SECONDS)
+            else:
+                self._schedule_wait_poll()
+            return True
+
+        # Normal control: is the miner able to mine?
+        pool_ok = (self.coordinator.data or {}).get("pool_connected")
+        intentionally_asleep = self._state in (STATE_SLEEPING, STATE_GOING_TO_SLEEP)
+        just_woke = (
+            self._state == STATE_WAKING and now - self._woke_at < WAKE_POOL_GRACE_SECONDS
+        )
+        if online and (pool_ok or intentionally_asleep or just_woke):
+            return False
+        _LOGGER.warning(
+            "Thermostat: miner %s; switching to the backup heater",
+            "unreachable" if not online else "not connected to its pool",
+        )
+        await self._start_backup(now)
+        return True
+
+    async def _start_backup(self, now: float, retry_in: float | None = None) -> None:
+        """Outage: switch to the backup and watch for the pool coming back."""
+        if retry_in is None:
+            retry_in = (
+                POOL_CHECK_INTERVAL_SECONDS if self._pool_addresses else BACKUP_PROBE_INTERVAL_SECONDS
+            )
+        self._next_probe = now + retry_in
+        await self._switch_to_backup(now, BACKUP_ACTIVE)
+        if self._backup_phase == BACKUP_ACTIVE:
+            self._schedule_wait_poll(retry_in)
+
+    async def _switch_to_backup(self, now: float, target: str) -> None:
+        """Miner to sleep (if it's awake and reachable), then backup on."""
+        self._cancel_autotune("cancelled: switched to the backup heater")
+        steps = []
+        if self._miner_online() and not self.coordinator.is_sleeping:
+            steps = self._sleep_steps()
+        if self._backup_phase not in (BACKUP_ACTIVE, BACKUP_MANUAL):
+            steps.append(("backup heater on", self._backup_on, None))
+        self._sequence = steps
+        self._sequence_done_state = STATE_BACKUP
+        self._state = STATE_SWITCHING_TO_BACKUP
+        self._backup_phase = BACKUP_SWITCHING
+        self._switch_target = target
+        self._want_sleep_since = self._want_wake_since = None
+        await self._run_sequence()
+        if not self._sequence:
+            self._backup_phase = target
+
+    def _start_probe(self, now: float, wake: bool) -> None:
+        async def wake_miner() -> None:
+            await self.coordinator.api.curtail_wakeup()
+            self._woke_at = time.time()
+
+        steps: list[tuple[str, Callable[[], Awaitable[Any]], Callable[[], bool] | None]] = [
+            ("backup heater off", self._backup_off, None)
+        ]
+        if wake:
+            steps.append(("wake", wake_miner, None))
+        else:
+            self._woke_at = time.time()
+        self._sequence = steps
+        self._sequence_done_state = STATE_CHECKING_POOL
+        self._state = STATE_CHECKING_POOL
+        self._backup_phase = BACKUP_PROBING
+        self._probe_started = now
+
+    async def _backup_on(self) -> None:
+        entity = self._backup_entity
+        await self.hass.services.async_call(
+            "climate", "set_hvac_mode", {"entity_id": entity, "hvac_mode": HVACMode.HEAT}, blocking=True
+        )
+        await self.hass.services.async_call(
+            "climate",
+            "set_temperature",
+            {"entity_id": entity, ATTR_TEMPERATURE: self._target_temperature},
+            blocking=True,
+        )
+
+    async def _backup_off(self) -> None:
+        await self.hass.services.async_call(
+            "climate", "set_hvac_mode", {"entity_id": self._backup_entity, "hvac_mode": HVACMode.OFF}, blocking=True
+        )
