@@ -1,4 +1,5 @@
 """Stealthminer API Client."""
+
 from __future__ import annotations
 
 import asyncio
@@ -315,9 +316,12 @@ class StealthminerAPI:
         """Wake up miner from curtailment."""
         return await self._execute_with_session(CMD_CURTAIL, f"wakeup,mode={mode}")
 
-    async def set_profile(self, profile_name: str, board: int = 0) -> dict[str, Any]:
+    async def set_profile(
+        self, profile_name: str, board: int | None = None
+    ) -> dict[str, Any]:
         """Set the mining profile."""
-        return await self._execute_with_session(CMD_PROFILESET, f"{board},{profile_name}")
+        params = profile_name if board is None else f"{board},{profile_name}"
+        return await self._execute_with_session(CMD_PROFILESET, params)
 
     async def reboot(self) -> dict[str, Any]:
         """Reboot the miner."""
