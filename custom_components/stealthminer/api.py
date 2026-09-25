@@ -33,6 +33,7 @@ from .const import (
     CMD_RESETMINER,
     CMD_POWERTARGETSET,
     CMD_LIMITS,
+    CMD_FANSET,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -322,6 +323,10 @@ class StealthminerAPI:
         """Set the mining profile."""
         params = profile_name if board is None else f"{board},{profile_name}"
         return await self._execute_with_session(CMD_PROFILESET, params)
+
+    async def set_fan_speed(self, speed: int) -> dict[str, Any]:
+        """Set fan speed in percent; -1 returns the fans to automatic control."""
+        return await self._execute_with_session(CMD_FANSET, f"speed={speed}")
 
     async def reboot(self) -> dict[str, Any]:
         """Reboot the miner."""

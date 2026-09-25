@@ -23,8 +23,17 @@
     "step": {
       "init": {
         "title": "Stealthminer Options",
+        "description": "Pick a temperature sensor to enable the thermostat. The controller asks for watts of heat and uses the nearest preset between the min and max presets. Gains: Kp in W per degree, Ki in W per degree-minute, Kd in W per degree/minute. The Thermostat Auto-tune switch can set them for you.",
         "data": {
-          "scan_interval": "Update interval (seconds)"
+          "scan_interval": "Update interval (seconds)",
+          "temperature_entity": "Temperature sensor",
+          "min_profile": "Min preset",
+          "max_profile": "Max preset",
+          "kp": "Kp (proportional gain)",
+          "ki": "Ki (integral gain)",
+          "kd": "Kd (derivative gain)",
+          "sleep_delay": "Sleep/wake delay",
+          "sleep_fan_speed": "Fan speed while asleep"
         }
       }
     }
@@ -106,6 +115,9 @@
       },
       "sleep_mode": {
         "name": "Sleep Mode"
+      },
+      "autotune": {
+        "name": "Thermostat Auto-tune"
       }
     },
     "button": {
@@ -124,9 +136,9 @@
         "name": "Profile"
       }
     },
-    "number": {
-      "power_limit": {
-        "name": "Power Limit"
+    "climate": {
+      "thermostat": {
+        "name": "Thermostat"
       }
     }
   }

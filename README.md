@@ -20,7 +20,7 @@ Home Assistant custom integration for monitoring and controlling Bitcoin miners 
   - ATM (Auto-Tuning Mode) toggle
   - Sleep mode / Wake up
   - Profile selection
-  - Power limit control with adaptive control loop
+  - PID thermostat that heats a room using the miner, with auto-tuning
   - Reboot and reset buttons
 
 - **Diagnostics**
@@ -58,7 +58,7 @@ Home Assistant custom integration for monitoring and controlling Bitcoin miners 
 
 ## Requirements
 
-- Home Assistant 2024.1.0 or newer
+- Home Assistant 2024.11.0 or newer
 - Miner running LuxOS firmware with HTTP API enabled (port 4028)
 
 ## Entities
@@ -91,10 +91,32 @@ Home Assistant custom integration for monitoring and controlling Bitcoin miners 
 | ATM Switch | Enable/disable Auto-Tuning Mode |
 | Sleep Mode Switch | Put miner to sleep / wake up |
 | Profile Select | Choose mining profile |
-| Power Limit | Set target power consumption |
+| Thermostat | Heat a room to a set temperature (see below) |
+| Thermostat Auto-tune Switch | Work out the thermostat gains automatically |
 | Reboot Button | Reboot the miner |
 | Reset Miner Button | Reset the miner application |
 | Wake Up Button | Wake the miner from sleep |
+
+## Thermostat
+
+To use the miner as a heater, open the integration's options (**Settings** > **Devices & Services** > **Stealthminer** > **Configure**) and pick a temperature sensor. A **Thermostat** entity then appears.
+
+- A PID controller works out how many watts of heat the room needs, and the thermostat uses the nearest preset between the **min** and **max presets** you choose. Presets are ordered by estimated wattage, scaled to the number of hash boards installed.
+- It waits at least 2 minutes between preset changes.
+- When the room needs less heat than the min preset gives, for longer than the **sleep/wake delay**, the miner goes to sleep without spinning the fans up: it switches to the min preset, sets the fans to a low manual speed, then sleeps. Waking runs the reverse (wake, fans back to automatic), and the thermostat holds the min preset for 2 minutes before moving up.
+- **Off** puts the miner to sleep the same way.
+
+### Tuning
+Gains are in watts: **Kp** is watts per degree off target, **Ki** is watts added per degree-minute, and **Kd** is usually left at 0.
+
+Turn on **Thermostat Auto-tune** while the thermostat is in Heat mode to set them automatically. It alternates between the min and max presets around the setpoint, measures 3 temperature swings (typically a few hours), then saves PI gains to the options. Run it when heat is actually needed: if the min preset alone keeps the room above the setpoint, the tune stops with an error.
+
+## Development
+
+```bash
+pip install -r requirements_test.txt
+pytest
+```
 
 ## Support
 

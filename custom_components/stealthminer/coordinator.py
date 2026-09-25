@@ -13,7 +13,7 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 from .api import StealthminerAPI, StealthminerAPIError, StealthminerConnectionError
-from .const import DOMAIN, DEFAULT_SCAN_INTERVAL
+from .const import DOMAIN, DEFAULT_SCAN_INTERVAL, STANDARD_BOARD_COUNT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -38,6 +38,8 @@ class StealthminerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.api = api
         self._device_info: dict[str, Any] = {}
+        # Set by the climate platform so other entities (auto-tune switch) can reach it
+        self.thermostat: Any = None
 
     @property
     def device_info(self) -> dict[str, Any]:
@@ -196,3 +198,27 @@ class StealthminerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self.data:
             return None
         return self.data.get(key)
+
+    def profiles_by_watts(self) -> list[tuple[str, float]]:
+        """Return (profile name, estimated watts) pairs, lowest wattage first.
+
+        The API reports wattages for a standard 3-board machine; these are
+        scaled to the number of boards actually present.
+        """
+        if not self.data:
+            return []
+        boards = max(1, self.data.get("board_count") or 1)
+        scale = boards / STANDARD_BOARD_COUNT
+        profiles = [
+            (p["Profile Name"], p["Watts"] * scale)
+            for p in self.data.get("profiles", [])
+            if p.get("Profile Name") and p.get("Watts")
+        ]
+        return sorted(profiles, key=lambda p: p[1])
+
+    @property
+    def is_sleeping(self) -> bool:
+        """Return True if the miner is curtailed (asleep)."""
+        if not self.data:
+            return False
+        return self.data.get("config", {}).get("CurtailMode", "None") != "None"

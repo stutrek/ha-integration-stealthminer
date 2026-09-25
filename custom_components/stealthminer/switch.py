@@ -5,13 +5,15 @@ import logging
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity, SwitchDeviceClass
+from homeassistant.components.climate import HVACMode
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .api import StealthminerAPIError
-from .const import DOMAIN
+from .const import CONF_TEMPERATURE_ENTITY, DOMAIN
 from .coordinator import StealthminerDataUpdateCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -29,6 +31,8 @@ async def async_setup_entry(
         StealthminerATMSwitch(coordinator),
         StealthminerCurtailSwitch(coordinator),
     ]
+    if entry.options.get(CONF_TEMPERATURE_ENTITY):
+        entities.append(StealthminerAutoTuneSwitch(coordinator))
 
     async_add_entities(entities)
 
@@ -129,4 +133,45 @@ class StealthminerCurtailSwitch(CoordinatorEntity[StealthminerDataUpdateCoordina
             self.coordinator.last_update_success
             and self.coordinator.data is not None
             and self.coordinator.data.get("online", False)
+        )
+
+
+class StealthminerAutoTuneSwitch(CoordinatorEntity[StealthminerDataUpdateCoordinator], SwitchEntity):
+    """Switch that runs thermostat auto-tuning; turning it off cancels."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Thermostat Auto-tune"
+    _attr_icon = "mdi:tune-variant"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, coordinator: StealthminerDataUpdateCoordinator) -> None:
+        """Initialize the switch."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{coordinator.api.host}_{coordinator.api.port}_autotune"
+        self._attr_device_info = coordinator.device_info
+
+    @property
+    def is_on(self) -> bool:
+        """Return true while auto-tuning is running."""
+        thermostat = self.coordinator.thermostat
+        return thermostat is not None and thermostat.autotune_active
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Start auto-tuning."""
+        if self.coordinator.thermostat is not None:
+            await self.coordinator.thermostat.async_start_autotune()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Cancel auto-tuning."""
+        if self.coordinator.thermostat is not None:
+            await self.coordinator.thermostat.async_cancel_autotune()
+
+    @property
+    def available(self) -> bool:
+        """Available while the thermostat is heating."""
+        thermostat = self.coordinator.thermostat
+        return (
+            self.coordinator.last_update_success
+            and thermostat is not None
+            and thermostat.hvac_mode == HVACMode.HEAT
         )

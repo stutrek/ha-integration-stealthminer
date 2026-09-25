@@ -6,6 +6,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import StealthminerAPI
@@ -39,6 +40,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Store coordinator in hass.data
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    # The Power Limit slider was replaced by the thermostat; drop its entity
+    registry = er.async_get(hass)
+    if entity_id := registry.async_get_entity_id(
+        "number", DOMAIN, f"{host}_{port}_power_limit"
+    ):
+        registry.async_remove(entity_id)
 
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()
