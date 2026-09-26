@@ -14,7 +14,6 @@ from homeassistant.const import (
     PERCENTAGE,
     UnitOfPower,
     UnitOfTemperature,
-    UnitOfTime,
     UnitOfFrequency,
     EntityCategory,
 )
@@ -44,9 +43,9 @@ SENSOR_TYPES: list[tuple] = [
     ("rejected_shares", "Rejected Shares", None, None, SensorStateClass.TOTAL_INCREASING, "mdi:close-circle", "summary.Rejected", None, None, True),
     ("stale_shares", "Stale Shares", None, None, SensorStateClass.TOTAL_INCREASING, "mdi:clock-alert", "summary.Stale", None, None, True),
     ("hardware_errors", "Hardware Errors", None, None, SensorStateClass.TOTAL_INCREASING, "mdi:alert-circle", "summary.Hardware Errors", None, None, True),
-    ("best_share", "Best Share", None, None, None, "mdi:trophy", "summary.Best Share", None, EntityCategory.DIAGNOSTIC, True),
+    ("best_share", "Best Share", None, None, SensorStateClass.MEASUREMENT, "mdi:trophy", "summary.Best Share", None, EntityCategory.DIAGNOSTIC, True),
     # Uptime
-    ("uptime", "Uptime", UnitOfTime.SECONDS, SensorDeviceClass.DURATION, SensorStateClass.TOTAL_INCREASING, None, "summary.Elapsed", None, EntityCategory.DIAGNOSTIC, True),
+    ("started", "Started", None, SensorDeviceClass.TIMESTAMP, None, "mdi:clock-start", None, "started_at", EntityCategory.DIAGNOSTIC, True),
     # Temperature sensors
     ("temp_board_max", "Board Temperature", UnitOfTemperature.CELSIUS, SensorDeviceClass.TEMPERATURE, SensorStateClass.MEASUREMENT, None, None, "temp_board_max", None, True),
     ("temp_exhaust_top", "Exhaust Temperature (Top)", UnitOfTemperature.CELSIUS, SensorDeviceClass.TEMPERATURE, SensorStateClass.MEASUREMENT, None, "temps.TopLeft", None, None, False),
@@ -64,7 +63,7 @@ SENSOR_TYPES: list[tuple] = [
     # Pool info
     ("pool_url", "Active Pool", None, None, None, "mdi:server-network", None, "active_pool_url", None, True),
     ("pool_user", "Pool User", None, None, None, "mdi:account", None, "active_pool_user", EntityCategory.DIAGNOSTIC, True),
-    ("pool_difficulty", "Pool Difficulty", None, None, None, "mdi:gauge", None, "active_pool_difficulty", EntityCategory.DIAGNOSTIC, True),
+    ("pool_difficulty", "Pool Difficulty", None, None, SensorStateClass.MEASUREMENT, "mdi:gauge", None, "active_pool_difficulty", EntityCategory.DIAGNOSTIC, True),
     # System info
     ("system_status", "System Status", None, None, None, "mdi:information", "config.SystemStatus", None, None, True),
     ("curtail_mode", "Curtail Mode", None, None, None, "mdi:sleep", "config.CurtailMode", None, EntityCategory.DIAGNOSTIC, True),
@@ -102,6 +101,22 @@ async def async_setup_entry(
         )
 
     async_add_entities(entities)
+
+
+def short_pool_user(user: str | None) -> str | None:
+    """Shorten a long pool username (usually account.worker) for display.
+
+    The account is often a 30+ character address; keep its first and last
+    four characters and the whole worker name.
+    """
+    if not user:
+        return user
+    account, dot, worker = user.rpartition(".")
+    if not dot:
+        account, worker = user, ""
+    if len(account) > 12:
+        account = f"{account[:4]}…{account[-4:]}"
+    return f"{account}.{worker}" if dot else account
 
 
 class StealthminerSensor(CoordinatorEntity[StealthminerDataUpdateCoordinator], SensorEntity):
@@ -195,12 +210,21 @@ class StealthminerSensor(CoordinatorEntity[StealthminerDataUpdateCoordinator], S
         if key == "active_pool_url":
             return data.get("active_pool_url")
         if key == "active_pool_user":
-            return data.get("active_pool_user")
+            return short_pool_user(data.get("active_pool_user"))
         if key == "active_pool_difficulty":
             return data.get("active_pool_difficulty")
         if key == "board_count":
             return data.get("board_count")
+        if key == "started_at":
+            return data.get("started_at")
 
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """The full pool username, since the state is shortened."""
+        if self._value_fn == "active_pool_user" and self.coordinator.data:
+            return {"full_user": self.coordinator.data.get("active_pool_user")}
         return None
 
     @property

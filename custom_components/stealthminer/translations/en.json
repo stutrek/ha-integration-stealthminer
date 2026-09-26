@@ -74,8 +74,8 @@
       "hardware_errors": {
         "name": "Hardware Errors"
       },
-      "uptime": {
-        "name": "Uptime"
+      "started": {
+        "name": "Started"
       },
       "temp_board_max": {
         "name": "Board Temperature"

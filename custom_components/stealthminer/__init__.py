@@ -41,12 +41,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
 
-    # The Power Limit slider was replaced by the thermostat; drop its entity
+    # Drop entities that were replaced: the Power Limit slider (by the
+    # thermostat) and the seconds-based Uptime sensor (by Started)
     registry = er.async_get(hass)
-    if entity_id := registry.async_get_entity_id(
-        "number", DOMAIN, f"{host}_{port}_power_limit"
-    ):
-        registry.async_remove(entity_id)
+    for domain, key in (("number", "power_limit"), ("sensor", "uptime")):
+        if entity_id := registry.async_get_entity_id(domain, DOMAIN, f"{host}_{port}_{key}"):
+            registry.async_remove(entity_id)
 
     # Fetch initial data
     await coordinator.async_config_entry_first_refresh()

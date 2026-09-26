@@ -96,9 +96,12 @@ async def setup(hass: HomeAssistant, options: dict | None = None):
         unique_id="192.0.2.10:8080",
     )
     entry.add_to_hass(hass)
-    # Leftover Power Limit entity from the old version
+    # Leftover entities from the old version
     er.async_get(hass).async_get_or_create(
         "number", DOMAIN, "192.0.2.10_8080_power_limit", config_entry=entry
+    )
+    er.async_get(hass).async_get_or_create(
+        "sensor", DOMAIN, "192.0.2.10_8080_uptime", config_entry=entry
     )
     with patch("custom_components.stealthminer.StealthminerAPI", FakeAPI):
         assert await hass.config_entries.async_setup(entry.entry_id)
@@ -623,3 +626,48 @@ async def test_restores_saved_state(hass, clock, backup):
     assert thermostat.preset_mode == ("Backup Only" if backup else None)
     if backup:
         assert thermostat._backup_phase == "manual"
+
+
+async def test_large_numbers_are_numeric_sensors(hass, clock):
+    # A state class makes the frontend format them as numbers (with thousands separators)
+    await setup(hass)
+    for entity in ("sensor.antminer_best_share", "sensor.antminer_pool_difficulty"):
+        assert hass.states.get(entity).attributes.get("state_class") == "measurement", entity
+
+
+async def test_started_timestamp_is_stable(hass, clock):
+    from datetime import datetime
+
+    entry, coord, thermostat, api = await setup(hass)
+    reg = er.async_get(hass)
+    assert reg.async_get_entity_id("sensor", DOMAIN, "192.0.2.10_8080_uptime") is None
+    state = hass.states.get("sensor.antminer_started")
+    assert state.attributes["device_class"] == "timestamp"
+    first = datetime.fromisoformat(state.state)
+    # A later poll a few seconds off doesn't move it
+    api.state["summary"]["Elapsed"] += 3
+    await poll(hass, coord)
+    assert datetime.fromisoformat(hass.states.get("sensor.antminer_started").state) == first
+    # A restart (uptime back near zero) does
+    api.state["summary"]["Elapsed"] = 5
+    await poll(hass, coord)
+    assert datetime.fromisoformat(hass.states.get("sensor.antminer_started").state) > first
+
+
+def test_short_pool_user():
+    from custom_components.stealthminer.sensor import short_pool_user
+
+    assert short_pool_user("12abCDEFGHIJKLMNOPQRSTUVWXYZ9xyz.rig01") == "12ab…9xyz.rig01"
+    assert short_pool_user("12abCDEFGHIJKLMNOPQRSTUVWXYZ9xyz") == "12ab…9xyz"
+    assert short_pool_user("shortname.rig01") == "shortname.rig01"
+    assert short_pool_user("") == ""
+    assert short_pool_user(None) is None
+
+
+async def test_pool_user_sensor_is_short_with_full_attribute(hass, clock):
+    entry, coord, thermostat, api = await setup(hass)
+    api.state["pools"][0]["User"] = "12abCDEFGHIJKLMNOPQRSTUVWXYZ9xyz.rig01"
+    await poll(hass, coord)
+    state = hass.states.get("sensor.antminer_pool_user")
+    assert state.state == "12ab…9xyz.rig01"
+    assert state.attributes["full_user"] == "12abCDEFGHIJKLMNOPQRSTUVWXYZ9xyz.rig01"

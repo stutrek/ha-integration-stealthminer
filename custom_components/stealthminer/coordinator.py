@@ -1,12 +1,13 @@
 """DataUpdateCoordinator for Stealthminer."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -38,6 +39,7 @@ class StealthminerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.api = api
         self._device_info: dict[str, Any] = {}
+        self._started_at: datetime | None = None
         # Set by the climate platform so other entities (auto-tune switch) can reach it
         self.thermostat: Any = None
 
@@ -168,6 +170,15 @@ class StealthminerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Board count
         data["board_count"] = len(devs) if devs else 0
+
+        # When mining started, from the uptime counter. Only move it if it's off by
+        # more than a minute (a restart), so polling jitter doesn't change it.
+        elapsed = summary.get("Elapsed")
+        if isinstance(elapsed, (int, float)):
+            started = dt_util.utcnow().replace(microsecond=0) - timedelta(seconds=elapsed)
+            if self._started_at is None or abs((started - self._started_at).total_seconds()) > 60:
+                self._started_at = started
+        data["started_at"] = self._started_at
 
         return data
 
