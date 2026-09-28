@@ -716,3 +716,14 @@ async def test_pool_user_sensor_is_short_with_full_attribute(hass, clock):
     state = hass.states.get("sensor.antminer_pool_user")
     assert state.state == "12ab…9xyz.rig01"
     assert state.attributes["full_user"] == "12abCDEFGHIJKLMNOPQRSTUVWXYZ9xyz.rig01"
+
+
+async def test_ramping_sensor(hass, clock):
+    entry, coord, thermostat, api = await setup(hass)
+    state = hass.states.get("binary_sensor.antminer_ramping")
+    assert state.state == "off" and state.attributes["ramping_boards"] == []
+    api.set_dev(mhs=3e6, ramping=True)
+    await poll(hass, coord)
+    state = hass.states.get("binary_sensor.antminer_ramping")
+    assert state.state == "on"
+    assert state.attributes["ramping_boards"] == [d["ID"] for d in api.state["devs"]]

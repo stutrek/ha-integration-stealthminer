@@ -25,6 +25,7 @@ BINARY_SENSOR_TYPES: list[tuple] = [
     ("pool_connected", "Pool Connected", BinarySensorDeviceClass.CONNECTIVITY, None, None, "pool_connected", True, None),
     ("atm_enabled", "ATM Enabled", None, "mdi:auto-fix", "atm.Enabled", None, True, None),
     ("is_mining", "Is Mining", BinarySensorDeviceClass.RUNNING, None, "config.CurtailMode", None, "None", None),
+    ("ramping", "Ramping", None, "mdi:trending-up", None, "ramping", True, None),
     ("psu_reporting", "PSU Reporting", None, "mdi:power-plug", "power.PSU", None, True, EntityCategory.DIAGNOSTIC),
     ("is_tuning", "Is Tuning", None, "mdi:tune-vertical", "config.IsTuning", None, True, EntityCategory.DIAGNOSTIC),
 ]
@@ -141,8 +142,17 @@ class StealthminerBinarySensor(CoordinatorEntity[StealthminerDataUpdateCoordinat
 
         if key == "pool_connected":
             return data.get("pool_connected", False)
+        if key == "ramping":
+            return data.get("ramping")
 
         return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """List which boards are ramping."""
+        if self._key != "ramping" or not self.coordinator.data:
+            return None
+        return {"ramping_boards": self.coordinator.data.get("ramping_boards", [])}
 
     @property
     def available(self) -> bool:

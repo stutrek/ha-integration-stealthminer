@@ -171,6 +171,10 @@ class StealthminerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Board count
         data["board_count"] = len(devs) if devs else 0
 
+        # Boards ramping up (after a wake or preset change)
+        data["ramping_boards"] = [d.get("ID") for d in devs if d.get("IsRamping")]
+        data["ramping"] = bool(data["ramping_boards"]) if devs else None
+
         # When mining started, from the uptime counter. Only move it if it's off by
         # more than a minute (a restart), so polling jitter doesn't change it.
         elapsed = summary.get("Elapsed")
