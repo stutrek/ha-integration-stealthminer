@@ -14,9 +14,12 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 from .api import StealthminerAPI, StealthminerAPIError, StealthminerConnectionError
-from .const import DOMAIN, DEFAULT_SCAN_INTERVAL, STANDARD_BOARD_COUNT
+from .const import DOMAIN, DEFAULT_SCAN_INTERVAL, SLOW_DATA_INTERVAL, STANDARD_BOARD_COUNT
 
 _LOGGER = logging.getLogger(__name__)
+
+# Fetched every update; everything else comes with the slow data
+FAST_KEYS = frozenset({"online", "summary", "power", "temps", "fans", "devs", "pools", "config"})
 
 
 class StealthminerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -40,6 +43,10 @@ class StealthminerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.api = api
         self._device_info: dict[str, Any] = {}
         self._started_at: datetime | None = None
+        # Last fetch of the slow-changing data, reused between full fetches
+        self._slow_data: dict[str, Any] = {}
+        self._slow_fetched_at: datetime | None = None
+        self._full_refresh_requested = False
         # Set by the climate platform so other entities (auto-tune switch) can reach it
         self.thermostat: Any = None
 
@@ -48,31 +55,38 @@ class StealthminerDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Return device info for the miner."""
         return self._device_info
 
+    async def async_refresh(self) -> None:
+        """Refresh everything; used after writes, so settings show up at once."""
+        self._full_refresh_requested = True
+        await super().async_refresh()
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from the Stealthminer API."""
+        now = dt_util.utcnow()
+        full = (
+            self._full_refresh_requested
+            or self._slow_fetched_at is None
+            or now - self._slow_fetched_at >= SLOW_DATA_INTERVAL
+        )
+        self._full_refresh_requested = False
         try:
-            data = await self.api.get_all_data()
-
-            # Fetch limits separately (less frequent, but needed for UI)
-            try:
-                data["limits"] = await self.api.get_limits()
-            except StealthminerAPIError:
-                data["limits"] = {}
-
-            # Update device info
-            self._update_device_info(data)
-
-            # Add computed values
-            data = self._add_computed_values(data)
-
-            return data
-
+            data = await self.api.get_all_data(include_slow=full)
         except StealthminerConnectionError as err:
             # Return offline state instead of failing completely
             _LOGGER.warning("Connection error: %s", err)
+            self._slow_fetched_at = None
             return {"online": False}
         except StealthminerAPIError as err:
             raise UpdateFailed(f"Error communicating with API: {err}") from err
+
+        if full:
+            self._slow_data = {k: v for k, v in data.items() if k not in FAST_KEYS}
+            self._slow_fetched_at = now
+        else:
+            data = {**self._slow_data, **data}
+
+        self._update_device_info(data)
+        return self._add_computed_values(data)
 
     def _update_device_info(self, data: dict[str, Any]) -> None:
         """Update device info from fetched data."""

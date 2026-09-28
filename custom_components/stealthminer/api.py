@@ -209,44 +209,44 @@ class StealthminerAPI:
         sessions = data.get("SESSION", [{}])
         return sessions[0].get("SessionID", "") if sessions else ""
 
-    async def get_all_data(self) -> dict[str, Any]:
-        """Get all data for coordinator update."""
-        # Fetch all data concurrently
+    async def get_all_data(self, include_slow: bool = True) -> dict[str, Any]:
+        """Get data for a coordinator update.
+
+        The fast set changes second to second; the slow set (profile list,
+        ATM and fan settings, limits) only changes on a write or a restart,
+        so it can be skipped.
+        """
+        fetchers: dict[str, Any] = {
+            "summary": self.get_summary,
+            "power": self.get_power,
+            "temps": self.get_temps,
+            "fans": self.get_fans,
+            "devs": self.get_devs,
+            "pools": self.get_pools,
+            "config": self.get_config,
+        }
+        if include_slow:
+            fetchers |= {
+                "version": self.get_version,
+                "profiles": self.get_profiles,
+                "atm": self.get_atm,
+                "devdetails": self.get_devdetails,
+                "tempctrl": self.get_tempctrl,
+                "limits": self.get_limits,
+            }
+
         results = await asyncio.gather(
-            self.get_version(),
-            self.get_summary(),
-            self.get_power(),
-            self.get_temps(),
-            self.get_fans(),
-            self.get_pools(),
-            self.get_profiles(),
-            self.get_atm(),
-            self.get_config(),
-            self.get_devs(),
-            self.get_devdetails(),
-            self.get_tempctrl(),
-            return_exceptions=True,
+            *(fetch() for fetch in fetchers.values()), return_exceptions=True
         )
 
-        # Process results
         data: dict[str, Any] = {"online": True}
-        keys = [
-            "version",
-            "summary",
-            "power",
-            "temps",
-            "fans",
-            "pools",
-            "profiles",
-            "atm",
-            "config",
-            "devs",
-            "devdetails",
-            "tempctrl",
-        ]
-
-        for key, result in zip(keys, results):
+        for key, result in zip(fetchers, results):
             if isinstance(result, Exception):
+                # Nothing came back at all: the miner is down, not one command
+                if isinstance(result, StealthminerConnectionError) and all(
+                    isinstance(r, StealthminerConnectionError) for r in results
+                ):
+                    raise result
                 _LOGGER.warning("Error fetching %s: %s", key, result)
                 data[key] = (
                     {}

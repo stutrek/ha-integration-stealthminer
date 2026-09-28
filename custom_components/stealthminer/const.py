@@ -1,6 +1,7 @@
 """Constants for the Exergy - Stealthminer integration."""
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Final
 
 DOMAIN: Final = "stealthminer"
@@ -21,7 +22,9 @@ CONF_BACKUP_CLIMATE: Final = "backup_climate"
 
 # Defaults
 DEFAULT_PORT: Final = 8080
-DEFAULT_SCAN_INTERVAL: Final = 30
+DEFAULT_SCAN_INTERVAL: Final = 5
+# Profile list, ATM/fan settings and limits only change on a write, which forces a refresh
+SLOW_DATA_INTERVAL: Final = timedelta(seconds=60)
 DEFAULT_TIMEOUT: Final = 10
 DEFAULT_MAX_PROFILE: Final = "default"
 DEFAULT_KP: Final = 100.0  # W per degree

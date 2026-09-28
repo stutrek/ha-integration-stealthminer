@@ -35,11 +35,13 @@ class FakeAPI:
         self.state = copy.deepcopy(DATA)
         self.state["config"]["Profile"] = "low"
         self.calls: list[tuple] = []
+        self.fetches: list[str] = []
         self.internet = True
         self.reachable = True
         FakeAPI.last = self
 
-    async def get_all_data(self):
+    async def get_all_data(self, include_slow=True):
+        self.fetches.append("full" if include_slow else "fast")
         if not self.reachable:
             raise StealthminerConnectionError("unreachable")
         asleep = self.state["config"]["CurtailMode"] != "None"
@@ -727,3 +729,18 @@ async def test_ramping_sensor(hass, clock):
     state = hass.states.get("binary_sensor.antminer_ramping")
     assert state.state == "on"
     assert state.attributes["ramping_boards"] == [d["ID"] for d in api.state["devs"]]
+
+
+async def test_scheduled_polls_skip_slow_data_until_due(hass, clock, freezer):
+    entry, coord, thermostat, api = await setup(hass)
+    api.fetches.clear()
+    for _ in range(2):
+        freezer.tick(timedelta(seconds=30))
+        async_fire_time_changed(hass)
+        await hass.async_block_till_done()
+    # 30 s poll is fast; by 60 s the slow data is due again
+    assert api.fetches == ["fast", "full"]
+    # A refresh after a write always fetches everything
+    await poll(hass, coord)
+    assert api.fetches[-1] == "full"
+    assert coord.data["profiles"] and coord.data["limits"]
