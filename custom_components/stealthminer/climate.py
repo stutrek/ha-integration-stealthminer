@@ -63,6 +63,8 @@ DWELL_SLACK_SECONDS = 5
 FAN_AUTO_FALLBACK_SECONDS = 300
 # How often to check while waiting for the ramp (instead of the 60 s tick)
 WAIT_POLL_SECONDS = 15
+# After a user change, wait this long for more clicks before acting on it
+USER_DEBOUNCE_SECONDS = 3
 AUTOTUNE_TIMEOUT_SECONDS = 12 * 3600
 # While the backup heater runs, how often HA checks whether the pool is reachable
 POOL_CHECK_INTERVAL_SECONDS = 30
@@ -184,8 +186,13 @@ class StealthminerThermostat(
         ] = []
         self._woke_at = 0.0
         self._cancel_wait_poll: Callable[[], None] | None = None
+        self._wait_poll_due = 0.0
         self._sequence_done_state: str | None = None
         self._lock = asyncio.Lock()
+        # Set by user commands: the next decision skips the dwell and sleep/wake delays
+        self._user_override = False
+        self._rerun = False
+        self._cancel_user_tick: Callable[[], None] | None = None
 
         self._tuner: RelayTuner | None = None
         self._tune_started = 0.0
@@ -246,6 +253,9 @@ class StealthminerThermostat(
         if self._cancel_wait_poll is not None:
             self._cancel_wait_poll()
             self._cancel_wait_poll = None
+        if self._cancel_user_tick is not None:
+            self._cancel_user_tick()
+            self._cancel_user_tick = None
         if self.coordinator.thermostat is self:
             self.coordinator.thermostat = None
         await super().async_will_remove_from_hass()
@@ -353,7 +363,7 @@ class StealthminerThermostat(
                     await self._backup_on()
                 except HomeAssistantError as err:
                     _LOGGER.error("Thermostat: couldn't update backup heater: %s", err)
-            await self._async_tick()
+            self._user_changed()
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         if hvac_mode == self._hvac_mode:
@@ -378,6 +388,7 @@ class StealthminerThermostat(
             if self._preset == PRESET_BACKUP_ONLY:
                 await self._switch_to_backup(time.time(), BACKUP_MANUAL)
         self.async_write_ha_state()
+        self._user_override = True
         await self._async_tick()
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
@@ -400,6 +411,7 @@ class StealthminerThermostat(
                 self._backup_phase = None
                 self._pid.reset_time()
         self._notify()
+        self._user_override = True
         await self._async_tick()
 
     async def async_turn_on(self) -> None:
@@ -463,14 +475,35 @@ class StealthminerThermostat(
             self._tuner = None
             self._tune_status = status
 
+    def _user_changed(self) -> None:
+        """Act on a user change soon, skipping the dwell and sleep/wake delays once.
+
+        Debounced so a burst of clicks on the setpoint makes one decision.
+        """
+        self._user_override = True
+        if self._cancel_user_tick is not None:
+            self._cancel_user_tick()
+
+        @callback
+        def _run(_now: Any) -> None:
+            self._cancel_user_tick = None
+            self.hass.async_create_task(self._async_tick())
+
+        self._cancel_user_tick = async_call_later(self.hass, USER_DEBOUNCE_SECONDS, _run)
+
     async def _async_tick(self, _now: Any = None) -> None:
         if self._lock.locked():
+            # Don't drop a user change that lands mid-tick
+            self._rerun = self._rerun or self._user_override
             return
         async with self._lock:
             try:
                 await self._control()
             finally:
                 self.async_write_ha_state()
+        if self._rerun:
+            self._rerun = False
+            self.hass.async_create_task(self._async_tick())
 
     async def _control(self) -> None:
         now = time.time()
@@ -484,6 +517,7 @@ class StealthminerThermostat(
             return
 
         if self._hvac_mode != HVACMode.HEAT:
+            self._user_override = False
             return
 
         if self._tuner is not None and now - self._tune_started > AUTOTUNE_TIMEOUT_SECONDS:
@@ -521,42 +555,56 @@ class StealthminerThermostat(
 
         self._wanted = wanted
         sleeping = self.coordinator.is_sleeping
+        override, self._user_override = self._user_override, False
 
+        # While a change is pending, check again when it's due rather than on the 60 s tick
         if wanted is None:
             self._want_wake_since = None
             if not sleeping:
                 self._want_sleep_since = self._want_sleep_since or now
-                if now - self._want_sleep_since >= self._sleep_delay:
+                if override or now - self._want_sleep_since >= self._sleep_delay:
                     self._start_sleep_sequence()
                     await self._run_sequence()
+                else:
+                    self._schedule_wait_poll(self._want_sleep_since + self._sleep_delay - now)
             return
 
         self._want_sleep_since = None
         if sleeping:
             self._want_wake_since = self._want_wake_since or now
             # Auto-tune wakes immediately; it needs the heat
-            if self._tuner is not None or now - self._want_wake_since >= self._sleep_delay:
+            if (
+                override
+                or self._tuner is not None
+                or now - self._want_wake_since >= self._sleep_delay
+            ):
                 self._start_wake_sequence()
                 await self._run_sequence()
+            else:
+                self._schedule_wait_poll(self._want_wake_since + self._sleep_delay - now)
             return
         self._want_wake_since = None
         self._state = STATE_RUNNING
 
         current = self.coordinator.data.get("config", {}).get("Profile")
-        if wanted != current and now - self._last_change >= MIN_DWELL_SECONDS - DWELL_SLACK_SECONDS:
-            _LOGGER.info(
-                "Thermostat: %.1f° -> %d W requested, preset %s -> %s",
-                measured,
-                watts,
-                current,
-                wanted,
-            )
-            try:
-                await self.coordinator.api.set_profile(wanted)
-                self._last_change = now
-                await self.coordinator.async_request_refresh()
-            except StealthminerAPIError as err:
-                _LOGGER.error("Thermostat: error setting preset %s: %s", wanted, err)
+        if wanted == current:
+            return
+        if not override and now - self._last_change < MIN_DWELL_SECONDS - DWELL_SLACK_SECONDS:
+            self._schedule_wait_poll(self._last_change + MIN_DWELL_SECONDS - now)
+            return
+        _LOGGER.info(
+            "Thermostat: %.1f° -> %d W requested, preset %s -> %s",
+            measured,
+            watts,
+            current,
+            wanted,
+        )
+        try:
+            await self.coordinator.api.set_profile(wanted)
+            self._last_change = now
+            await self.coordinator.async_request_refresh()
+        except StealthminerAPIError as err:
+            _LOGGER.error("Thermostat: error setting preset %s: %s", wanted, err)
 
     async def _finish_autotune(self) -> None:
         tuner = self._tuner
@@ -673,15 +721,23 @@ class StealthminerThermostat(
         return hashing and not ramping
 
     def _schedule_wait_poll(self, delay: float = WAIT_POLL_SECONDS) -> None:
-        """Check again soon, rather than waiting for the 60 s tick."""
+        """Check again soon, rather than waiting for the 60 s tick.
+
+        An already-scheduled check is kept unless this one is due sooner.
+        """
+        delay = max(1.0, delay)
+        due = time.time() + delay
         if self._cancel_wait_poll is not None:
-            return
+            if self._wait_poll_due <= due:
+                return
+            self._cancel_wait_poll()
 
         @callback
         def _poll(_now: Any) -> None:
             self._cancel_wait_poll = None
             self.hass.async_create_task(self._async_tick())
 
+        self._wait_poll_due = due
         self._cancel_wait_poll = async_call_later(self.hass, delay, _poll)
 
     # ---- Backup heater ----

@@ -1,5 +1,6 @@
 """Integration tests for the Stealthminer thermostat, against a fake miner."""
 import copy
+from datetime import timedelta
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import entity_registry as er
 from homeassistant.core import State
-from pytest_homeassistant_custom_component.common import MockConfigEntry, mock_restore_cache
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_fire_time_changed,
+    mock_restore_cache,
+)
 
 from custom_components.stealthminer import climate as climate_mod
 from custom_components.stealthminer.api import StealthminerConnectionError
@@ -165,12 +171,51 @@ async def test_heats_when_cold_and_respects_dwell(hass, clock):
     assert api.calls and api.calls[-1][0] == "set_profile"
     first = api.calls[-1][1]
     assert first not in ("low", "default")
+    changed_at = clock.t
     hass.states.async_set(SENSOR, "55")
     await tick(hass, thermostat, clock, 1)  # within 2-minute dwell: no change
     assert api.calls[-1] == ("set_profile", first)
+    # Checks again when the dwell ends, not on the next 60 s tick
+    assert thermostat._cancel_wait_poll is not None
+    assert thermostat._wait_poll_due == changed_at + climate_mod.MIN_DWELL_SECONDS
     await tick(hass, thermostat, clock, 1.5)
     assert api.calls[-1][1] != first
     assert thermostat.hvac_action == HVACAction.HEATING
+
+
+async def test_setpoint_change_skips_dwell_after_debounce(hass, clock):
+    entry, coord, thermostat, api = await setup(hass)
+    await thermostat.async_set_hvac_mode(HVACMode.HEAT)
+    hass.states.async_set(SENSOR, "62")
+    await tick(hass, thermostat, clock, 3)
+    first = api.calls[-1][1]
+    count = len(api.calls)
+
+    # A burst of clicks within the dwell: nothing until the debounce ends, then one change
+    clock.t += 10
+    for temp in (70, 72, 75):
+        await thermostat.async_set_temperature(temperature=temp)
+    await hass.async_block_till_done()
+    assert len(api.calls) == count
+    async_fire_time_changed(
+        hass, dt_util.utcnow() + timedelta(seconds=climate_mod.USER_DEBOUNCE_SECONDS + 1)
+    )
+    await hass.async_block_till_done()
+    assert len(api.calls) == count + 1
+    assert api.calls[-1][0] == "set_profile" and api.calls[-1][1] != first
+
+
+async def test_setpoint_change_skips_sleep_delay(hass, clock):
+    entry, coord, thermostat, api = await setup(hass)
+    await thermostat.async_set_hvac_mode(HVACMode.HEAT)
+    api.state["config"]["Profile"] = "170MHz"
+    hass.states.async_set(SENSOR, "72")
+    await thermostat.async_set_temperature(temperature=60)
+    async_fire_time_changed(
+        hass, dt_util.utcnow() + timedelta(seconds=climate_mod.USER_DEBOUNCE_SECONDS + 1)
+    )
+    await hass.async_block_till_done()
+    assert api.calls[-3:] == [("set_profile", "low"), ("fan", 20), ("sleep",)]
 
 
 async def test_sleep_and_wake_sequences(hass, clock):
